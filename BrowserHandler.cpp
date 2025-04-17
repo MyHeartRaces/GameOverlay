@@ -1,9 +1,9 @@
 // GameOverlay - BrowserHandler.cpp
-// Phase 2: CEF Integration
-// Handles browser events and rendering callbacks
+// Phase 6: DirectX 12 Migration
+// Handles browser events and rendering callbacks for DirectX 12
 
 #include "BrowserHandler.h"
-#include <d3d11.h>
+#include <d3d12.h>
 
 BrowserHandler::BrowserHandler() {
 }
@@ -29,51 +29,33 @@ void BrowserHandler::OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType typ
     if (type == PET_VIEW && m_sharedTexture && buffer) {
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        // Copy browser rendering to shared DirectX texture
-        ID3D11Texture2D* texture = static_cast<ID3D11Texture2D*>(m_sharedTexture);
-        if (!texture) return;
+        // For DirectX 12, this would be an ID3D12Resource in an upload heap
+        ID3D12Resource* uploadBuffer = static_cast<ID3D12Resource*>(m_sharedTexture);
+        if (!uploadBuffer) return;
 
-        // Get texture description to verify size
-        D3D11_TEXTURE2D_DESC desc;
-        texture->GetDesc(&desc);
+        // Map the upload buffer for CPU write
+        D3D12_RANGE readRange = { 0, 0 }; // We don't intend to read
+        void* mappedData = nullptr;
+        HRESULT hr = uploadBuffer->Map(0, &readRange, &mappedData);
 
-        // Get device context associated with texture
-        ID3D11Device* device = nullptr;
-        texture->GetDevice(&device);
-        if (!device) return;
-
-        ID3D11DeviceContext* context = nullptr;
-        device->GetImmediateContext(&context);
-        if (!context) {
-            device->Release();
-            return;
-        }
-
-        // Map texture for writing
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = context->Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (SUCCEEDED(hr)) {
-            // Calculate source and destination stride
-            int src_stride = width * 4; // BGRA = 4 bytes per pixel
-            int dst_stride = mapped.RowPitch;
+            // Calculate source and destination dimensions
+            size_t rowPitch = (width * 4 + 255) & ~255; // Align to 256 bytes for DirectX 12
 
-            // Copy pixel data row by row
+            // Copy the browser pixel data to the upload buffer
+            // The browser buffer is tightly packed BGRA data
             const unsigned char* src = static_cast<const unsigned char*>(buffer);
-            unsigned char* dst = static_cast<unsigned char*>(mapped.pData);
+            unsigned char* dst = static_cast<unsigned char*>(mappedData);
 
-            for (int i = 0; i < height && i < (int)desc.Height; ++i) {
-                memcpy(dst, src, std::min(src_stride, dst_stride));
-                src += src_stride;
-                dst += dst_stride;
+            // Copy row by row
+            for (int i = 0; i < height; i++) {
+                memcpy(dst + i * rowPitch, src + i * width * 4, width * 4);
             }
 
-            // Unmap the texture
-            context->Unmap(texture, 0);
+            // Calculate range of written data for proper unmapping
+            D3D12_RANGE writtenRange = { 0, height * rowPitch };
+            uploadBuffer->Unmap(0, &writtenRange);
         }
-
-        // Release resources
-        context->Release();
-        device->Release();
     }
 }
 

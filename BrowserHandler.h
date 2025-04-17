@@ -1,6 +1,6 @@
 // GameOverlay - BrowserHandler.h
-// Phase 2: CEF Integration
-// Handles browser events and rendering callbacks
+// Phase 6: DirectX 12 Migration
+// Handles browser events and rendering callbacks for DirectX 12
 
 #pragma once
 
@@ -9,6 +9,7 @@
 #include "cef_life_span_handler.h"
 #include "cef_load_handler.h"
 #include "cef_display_handler.h"
+#include <d3d12.h>
 #include <string>
 #include <mutex>
 
@@ -19,7 +20,7 @@ class BrowserHandler : public CefRenderHandler,
 public:
     BrowserHandler();
 
-    // Shared texture for DirectX integration
+    // Shared texture for DirectX 12 integration
     void SetSharedTexture(void* texture) { m_sharedTexture = texture; }
     void* GetSharedTexture() const { return m_sharedTexture; }
 
@@ -51,7 +52,7 @@ public:
     void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) override;
 
 private:
-    // Shared texture for DirectX integration
+    // Shared texture for DirectX 12 integration
     void* m_sharedTexture = nullptr;
 
     // Browser state

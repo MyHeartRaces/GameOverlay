@@ -1,11 +1,11 @@
 // GameOverlay - ImGuiSystem.cpp
-// Phase 1: Foundation Framework
-// Dear ImGui integration for UI rendering
+// Phase 6: DirectX 12 Migration
+// Dear ImGui integration for UI rendering with DirectX 12
 
 #include "ImGuiSystem.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
-#include "imgui_impl_dx11.h"
+#include "imgui_impl_dx12.h"
 #include <stdexcept>
 
 // Forward declare message handler from imgui_impl_win32.cpp
@@ -21,6 +21,16 @@ ImGuiSystem::~ImGuiSystem() {
 }
 
 void ImGuiSystem::InitializeImGui(HWND hwnd, RenderSystem* renderSystem) {
+    // Create descriptor heap for ImGui
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = 1;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    if (FAILED(renderSystem->GetDevice()->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_srvDescHeap)))) {
+        throw std::runtime_error("Failed to create descriptor heap for ImGui");
+    }
+
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     m_imguiContext = ImGui::CreateContext();
@@ -41,10 +51,14 @@ void ImGuiSystem::InitializeImGui(HWND hwnd, RenderSystem* renderSystem) {
         throw std::runtime_error("Failed to initialize ImGui Win32 backend");
     }
 
-    if (!ImGui_ImplDX11_Init(
+    if (!ImGui_ImplDX12_Init(
         renderSystem->GetDevice(),
-        renderSystem->GetDeviceContext())) {
-        throw std::runtime_error("Failed to initialize ImGui DirectX 11 backend");
+        3, // Num frames in flight
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        m_srvDescHeap.Get(),
+        m_srvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+        m_srvDescHeap->GetGPUDescriptorHandleForHeapStart())) {
+        throw std::runtime_error("Failed to initialize ImGui DirectX 12 backend");
     }
 
     // Load fonts
@@ -74,7 +88,7 @@ void ImGuiSystem::InitializeImGui(HWND hwnd, RenderSystem* renderSystem) {
 }
 
 void ImGuiSystem::ShutdownImGui() {
-    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext(m_imguiContext);
     m_imguiContext = nullptr;
@@ -82,7 +96,7 @@ void ImGuiSystem::ShutdownImGui() {
 
 void ImGuiSystem::BeginFrame() {
     // Start the Dear ImGui frame
-    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 }
@@ -90,13 +104,19 @@ void ImGuiSystem::BeginFrame() {
 void ImGuiSystem::EndFrame() {
     // Render Dear ImGui
     ImGui::Render();
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    // Set descriptor heaps
+    ID3D12DescriptorHeap* heaps[] = { m_srvDescHeap.Get() };
+    m_renderSystem->GetCommandList()->SetDescriptorHeaps(_countof(heaps), heaps);
+
+    // Render ImGui draw data
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_renderSystem->GetCommandList());
 
     // Update and Render additional Platform Windows
     ImGuiIO& io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         ImGui::UpdatePlatformWindows();
-        ImGui::RenderPlatformWindowsDefault();
+        ImGui::RenderPlatformWindowsDefault(nullptr, (void*)m_renderSystem->GetCommandList());
     }
 }
 
@@ -109,7 +129,7 @@ void ImGuiSystem::RenderDemoWindow() {
     ImGui::SetNextWindowBgAlpha(0.35f);
     if (ImGui::Begin("GameOverlay", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
-        ImGui::Text("GameOverlay - Phase 5: Performance Optimization");
+        ImGui::Text("GameOverlay - Phase 6: DirectX 12 Migration");
         ImGui::Separator();
         ImGui::Text("%.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
     }

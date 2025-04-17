@@ -1,5 +1,5 @@
 // GameOverlay - main.cpp
-// Phase 1: Foundation Framework
+// Phase 6: DirectX 12 Migration
 // Main application entry point
 
 #include <Windows.h>
@@ -7,16 +7,21 @@
 #include <memory>
 #include <stdexcept>
 #include "GameOverlay.h"
+#include "PipelineStateManager.h"
+#include "CommandAllocatorPool.h"
 
 // Forward declarations
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+// Global references for WindowProc
+HotkeyManager* g_hotkeyManager = nullptr;
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     try {
         // Create window manager
         auto windowManager = std::make_unique<WindowManager>(hInstance, WindowProc);
 
-        // Create render system
+        // Create DirectX 12 render system
         auto renderSystem = std::make_unique<RenderSystem>(windowManager->GetHWND(), windowManager->GetWidth(), windowManager->GetHeight());
 
         // Create performance monitor
@@ -27,6 +32,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         // Set global reference for WindowProc
         g_hotkeyManager = hotkeyManager.get();
+
+        // Create pipeline state manager for DirectX 12
+        auto pipelineStateManager = std::make_unique<PipelineStateManager>(renderSystem.get());
+        pipelineStateManager->Initialize();
+
+        // Create command allocator pool for DirectX 12
+        auto commandAllocatorPool = std::make_unique<CommandAllocatorPool>(
+            renderSystem->GetDevice(), D3D12_COMMAND_LIST_TYPE_DIRECT);
 
         // Create browser view
         auto browserView = std::make_unique<BrowserView>(renderSystem.get());
@@ -111,6 +124,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Cleanup in reverse order of creation
         performanceOptimizer->Suspend();
 
+        // Make sure GPU is done before destroying resources
+        renderSystem->WaitForGpu();
+
         // Explicitly shut down browser before other resources
         browserView->Shutdown();
 
@@ -122,9 +138,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 }
-
-// Forward declaration for HotkeyManager reference
-HotkeyManager* g_hotkeyManager = nullptr;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     // Process ImGui input messages

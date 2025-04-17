@@ -1,11 +1,12 @@
 // GameOverlay - ImGuiSystem.h
-// Phase 1: Foundation Framework
-// Dear ImGui integration for UI rendering
+// Phase 6: DirectX 12 Migration
+// Dear ImGui integration for UI rendering with DirectX 12
 
 #pragma once
 
 #include <Windows.h>
-#include <d3d11.h>
+#include <d3d12.h>
+#include <wrl/client.h>
 #include "RenderSystem.h"
 
 // Forward declarations
@@ -40,4 +41,9 @@ private:
     RenderSystem* m_renderSystem = nullptr;
     HWND m_hwnd = nullptr;
     bool m_showDemoWindow = true;
+
+    // DirectX 12 specific resources
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvDescHeap;
+    UINT m_fontDescriptorIndex = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_fontTextureResource;
 };

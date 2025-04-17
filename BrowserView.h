@@ -1,10 +1,10 @@
 // GameOverlay - BrowserView.h
-// Phase 2: CEF Integration
-// Manages browser rendering and DirectX integration
+// Phase 6: DirectX 12 Migration
+// Manages browser rendering and DirectX 12 integration
 
 #pragma once
 
-#include <d3d11.h>
+#include <d3d12.h>
 #include <wrl/client.h>
 #include <string>
 #include <memory>
@@ -37,7 +37,8 @@ public:
     BrowserManager* GetBrowserManager() { return m_browserManager.get(); }
 
     // Texture access for ImGui
-    ID3D11ShaderResourceView* GetShaderResourceView() const { return m_shaderResourceView.Get(); }
+    ID3D12Resource* GetTexture() const { return m_browserTexture.Get(); }
+    UINT GetSRVDescriptorIndex() const { return m_srvDescriptorIndex; }
 
     // Performance optimization
     void AdaptToPerformanceState(PerformanceState state, ResourceUsageLevel level);
@@ -52,11 +53,13 @@ private:
     // Create texture resources
     void CreateBrowserTexture(int width, int height);
     void ReleaseBrowserTexture();
+    void UpdateBrowserTexture(const void* buffer, int width, int height);
 
-    // DirectX resources
+    // DirectX 12 resources
     RenderSystem* m_renderSystem = nullptr;
-    ComPtr<ID3D11Texture2D> m_browserTexture;
-    ComPtr<ID3D11ShaderResourceView> m_shaderResourceView;
+    ComPtr<ID3D12Resource> m_browserTexture;        // Default heap texture (GPU-only)
+    ComPtr<ID3D12Resource> m_uploadTexture;         // Upload heap texture (for CPU write)
+    UINT m_srvDescriptorIndex = UINT_MAX;           // SRV descriptor index in the heap
 
     // Browser resources
     std::unique_ptr<BrowserManager> m_browserManager;
