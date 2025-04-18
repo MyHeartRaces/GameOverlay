@@ -1,15 +1,24 @@
 // GameOverlay - BrowserManager.cpp
-// Phase 2: CEF Integration
 // Manages CEF initialization and browser instances
 
 #include "BrowserManager.h"
 #include "BrowserApp.h"
 #include "BrowserClient.h"
+#include "BrowserView.h" // Include for signalling
 #include <sstream>
 #include <filesystem>
+#include <stdexcept> // Include for error checking
 
-BrowserManager::BrowserManager()
-    : m_browserHandler(new BrowserHandler()) {
+// BrowserManager Constructor
+BrowserManager::BrowserManager(BrowserView* view)
+    : m_browserHandler(new BrowserHandler()), // Initialize handler first
+    m_browserClient(new BrowserClient(m_browserHandler)), // Initialize client with handler
+    m_browserView(view) // Store pointer to BrowserView
+{
+    if (!m_browserView) {
+        // Optional: Throw or log error if BrowserView is null
+        // throw std::invalid_argument("BrowserView cannot be null in BrowserManager constructor");
+    }
 }
 
 BrowserManager::~BrowserManager() {
@@ -17,6 +26,11 @@ BrowserManager::~BrowserManager() {
 }
 
 bool BrowserManager::Initialize(HINSTANCE hInstance) {
+    // Check if already initialized or in subprocess
+    if (m_initialized || m_isSubprocess) {
+        return m_initialized;
+    }
+
     // Check if we're a CEF subprocess
     CefMainArgs main_args(hInstance);
 
@@ -28,29 +42,34 @@ bool BrowserManager::Initialize(HINSTANCE hInstance) {
     if (exit_code >= 0) {
         // This is a subprocess - exit with returned code
         m_isSubprocess = true;
-        return false;
+        return false; // Indicate subprocess mode
     }
 
     // Initialize CEF settings
     CefSettings settings;
-    settings.no_sandbox = true;
-    settings.multi_threaded_message_loop = false;
-    settings.windowless_rendering_enabled = true;
+    settings.no_sandbox = true; // Required for many environments
+    settings.multi_threaded_message_loop = false; // We run the loop manually
+    settings.windowless_rendering_enabled = true; // Essential for overlays
 
-    // Enable remote debugging on port 8088
+    // Enable remote debugging on port 8088 (optional, useful for development)
     settings.remote_debugging_port = 8088;
 
-    // Use in-memory cache to reduce disk I/O
+    // Cache settings (adjust as needed)
     settings.persist_session_cookies = false;
     settings.persist_user_preferences = false;
+    // CefString(&settings.cache_path) = "path/to/cache"; // Optional: Specify a cache path
 
     // Get current executable path for subprocess
     char szPath[MAX_PATH];
-    GetModuleFileNameA(NULL, szPath, MAX_PATH);
+    if (GetModuleFileNameA(NULL, szPath, MAX_PATH) == 0) {
+        // Handle error - unable to get executable path
+        return false;
+    }
     CefString(&settings.browser_subprocess_path).FromASCII(szPath);
 
     // Initialize CEF
     if (!CefInitialize(main_args, settings, app, nullptr)) {
+        // Handle error - CEF initialization failed
         return false;
     }
 
@@ -62,63 +81,71 @@ void BrowserManager::Shutdown() {
     // Close any existing browser
     CloseBrowser(true);
 
-    // Shut down CEF if initialized
-    if (m_initialized) {
+    // Shut down CEF if initialized and not in subprocess
+    if (m_initialized && !m_isSubprocess) {
         CefShutdown();
-        m_initialized = false;
     }
+
+    m_browser = nullptr;
+    m_browserClient = nullptr; // Release client ref
+    // m_browserHandler is ref-counted, CefClient handles its release
+
+    m_initialized = false;
 }
 
 bool BrowserManager::CreateBrowser(const std::string& url) {
-    if (!m_initialized) return false;
+    if (!m_initialized || m_isSubprocess) return false;
 
-    // Close any existing browser
+    // Close any existing browser first
     CloseBrowser(true);
 
     // Configure window info for off-screen rendering
     CefWindowInfo window_info;
-    window_info.SetAsWindowless(nullptr); // No parent window needed for off-screen rendering
+    window_info.SetAsWindowless(nullptr); // No parent window needed
 
     // Browser settings
     CefBrowserSettings browser_settings;
-    browser_settings.windowless_frame_rate = 60; // 60 fps
+    browser_settings.windowless_frame_rate = 60; // Target FPS for rendering
 
-    // Set javascript flags to reduce memory usage
-    CefString(&browser_settings.javascript_flags).FromASCII("--expose-gc --max-old-space-size=128");
+    // Optional: Set background color (e.g., transparent)
+    // browser_settings.background_color = CefColorSetARGB(0, 0, 0, 0);
 
-    // Disable web security for overlay functionality
-    browser_settings.web_security = STATE_DISABLED;
+    // Optional: Web preferences
+    // CefString(&browser_settings.default_encoding).FromASCII("UTF-8");
 
-    // Create browser client
-    CefRefPtr<BrowserClient> client(new BrowserClient(m_browserHandler));
-
-    // Create the browser synchronously
+    // Create the browser asynchronously (or use CreateBrowserSync if needed)
+    // Using sync here based on original code structure
     m_browser = CefBrowserHost::CreateBrowserSync(
         window_info,
-        client,
+        m_browserClient, // Use the member client
         url,
         browser_settings,
-        nullptr,
-        nullptr
+        nullptr, // Extra info
+        nullptr  // Request context
     );
 
-    if (!m_browser) return false;
+    if (!m_browser) {
+        // Handle error - Browser creation failed
+        return false;
+    }
 
-    // Set browser size for off-screen rendering
-    m_browser->GetHost()->WasResized();
+    // Need to explicitly tell the host the initial size
+    if (m_browser->GetHost()) {
+        m_browser->GetHost()->WasResized();
+    }
 
     return true;
 }
 
 void BrowserManager::CloseBrowser(bool forceClose) {
-    if (m_browser) {
+    if (m_browser && m_browser->GetHost()) {
         m_browser->GetHost()->CloseBrowser(forceClose);
-        m_browser = nullptr;
     }
+    // CefLifeSpanHandler::OnBeforeClose will set m_browser to null later
 }
 
 void BrowserManager::LoadURL(const std::string& url) {
-    if (m_browser) {
+    if (m_browser && m_browser->GetMainFrame()) {
         m_browser->GetMainFrame()->LoadURL(url);
     }
 }
@@ -153,7 +180,8 @@ void BrowserManager::StopLoad() {
 }
 
 bool BrowserManager::IsLoading() const {
-    return m_browser ? m_browser->IsLoading() : false;
+    // Check handler first as browser might be closing
+    return m_browserHandler && m_browserHandler->IsLoading();
 }
 
 bool BrowserManager::CanGoBack() const {
@@ -165,23 +193,37 @@ bool BrowserManager::CanGoForward() const {
 }
 
 std::string BrowserManager::GetURL() const {
-    if (!m_browser) return "";
-    return m_browser->GetMainFrame()->GetURL().ToString();
+    if (m_browser && m_browser->GetMainFrame()) {
+        return m_browser->GetMainFrame()->GetURL().ToString();
+    }
+    return "";
 }
 
 std::string BrowserManager::GetTitle() const {
-    if (!m_browserHandler) return "";
-    return m_browserHandler->GetTitle();
+    // Get title from handler as it's updated via callbacks
+    return m_browserHandler ? m_browserHandler->GetTitle() : "";
 }
 
 void BrowserManager::DoMessageLoopWork() {
-    if (m_initialized) {
+    if (m_initialized && !m_isSubprocess) {
         CefDoMessageLoopWork();
     }
 }
 
-void BrowserManager::OnPaint(void* shared_texture) {
-    if (m_browserHandler) {
-        m_browserHandler->SetSharedTexture(shared_texture);
+// This method is now called by BrowserHandler when OnPaint occurs
+void BrowserManager::OnPaint(const void* buffer, int width, int height) {
+    if (m_browserView && buffer) {
+        // Signal BrowserView that new texture data is available in the upload buffer
+        m_browserView->SignalTextureUpdateFromHandler(buffer, width, height);
     }
+}
+
+unsigned int BrowserManager::GetBrowserWidth() const {
+    // Get dimensions from the handler, which holds the correct size
+    return m_browserHandler ? m_browserHandler->GetWidth() : 0;
+}
+
+unsigned int BrowserManager::GetBrowserHeight() const {
+    // Get dimensions from the handler
+    return m_browserHandler ? m_browserHandler->GetHeight() : 0;
 }

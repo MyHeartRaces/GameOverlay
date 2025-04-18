@@ -1,21 +1,36 @@
 // GameOverlay - BrowserHandler.cpp
-// Phase 6: DirectX 12 Migration
 // Handles browser events and rendering callbacks for DirectX 12
 
 #include "BrowserHandler.h"
-#include <d3d12.h>
+#include "BrowserManager.h" // Include manager for signalling
+#include <d3d12.h>          // Keep includes potentially needed
 
-BrowserHandler::BrowserHandler() {
+BrowserHandler::BrowserHandler() {}
+
+void BrowserHandler::SetBrowserManager(BrowserManager* manager) {
+    m_browserManager = manager;
 }
 
 void BrowserHandler::SetBrowserSize(int width, int height) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     m_width = width;
     m_height = height;
+    // Note: CefBrowserHost::WasResized needs to be called externally
+    // when the logical size changes.
 }
 
-bool BrowserHandler::GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) {
+std::string BrowserHandler::GetTitle() const {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return m_title;
+}
+
+bool BrowserHandler::IsLoading() const {
+    return m_isLoading;
+}
+
+// --- CefRenderHandler methods ---
+
+bool BrowserHandler::GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) {
+    // No lock needed for atomics
     rect.x = 0;
     rect.y = 0;
     rect.width = m_width;
@@ -26,56 +41,35 @@ bool BrowserHandler::GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) {
 void BrowserHandler::OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type,
     const RectList& dirtyRects, const void* buffer,
     int width, int height) {
-    if (type == PET_VIEW && m_sharedTexture && buffer) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        // For DirectX 12, this would be an ID3D12Resource in an upload heap
-        ID3D12Resource* uploadBuffer = static_cast<ID3D12Resource*>(m_sharedTexture);
-        if (!uploadBuffer) return;
-
-        // Map the upload buffer for CPU write
-        D3D12_RANGE readRange = { 0, 0 }; // We don't intend to read
-        void* mappedData = nullptr;
-        HRESULT hr = uploadBuffer->Map(0, &readRange, &mappedData);
-
-        if (SUCCEEDED(hr)) {
-            // Calculate source and destination dimensions
-            size_t rowPitch = (width * 4 + 255) & ~255; // Align to 256 bytes for DirectX 12
-
-            // Copy the browser pixel data to the upload buffer
-            // The browser buffer is tightly packed BGRA data
-            const unsigned char* src = static_cast<const unsigned char*>(buffer);
-            unsigned char* dst = static_cast<unsigned char*>(mappedData);
-
-            // Copy row by row
-            for (int i = 0; i < height; i++) {
-                memcpy(dst + i * rowPitch, src + i * width * 4, width * 4);
-            }
-
-            // Calculate range of written data for proper unmapping
-            D3D12_RANGE writtenRange = { 0, height * rowPitch };
-            uploadBuffer->Unmap(0, &writtenRange);
-        }
+    // We only care about the main view paint events
+    if (type == PET_VIEW && buffer && m_browserManager) {
+        // Directly call the manager's OnPaint method
+        // This decouples the handler from the specific texture update mechanism
+        m_browserManager->OnPaint(buffer, width, height);
     }
 }
 
+// --- CefLifeSpanHandler methods ---
+
 void BrowserHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     m_browserCreated = true;
 }
 
 bool BrowserHandler::DoClose(CefRefPtr<CefBrowser> browser) {
-    return false; // Allow the close to proceed
+    // Allow the close to proceed. The browser object will be released.
+    return false;
 }
 
 void BrowserHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     m_browserCreated = false;
+    m_isLoading = false;
+    // Reset any other relevant state if needed
 }
+
+// --- CefLoadHandler methods ---
 
 void BrowserHandler::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
     TransitionType transition_type) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (frame->IsMain()) {
         m_isLoading = true;
     }
@@ -83,7 +77,6 @@ void BrowserHandler::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFra
 
 void BrowserHandler::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
     int httpStatusCode) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (frame->IsMain()) {
         m_isLoading = false;
     }
@@ -92,20 +85,26 @@ void BrowserHandler::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame
 void BrowserHandler::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
     ErrorCode errorCode, const CefString& errorText,
     const CefString& failedUrl) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (frame->IsMain()) {
         m_isLoading = false;
 
-        // Display error page
-        std::string error_html = "<html><body style='background-color: #f0f0f0;'>"
-            "<h2>Error loading page</h2>"
-            "<p>Failed to load: " + failedUrl.ToString() + "</p>"
-            "<p>Error: " + errorText.ToString() + " (" + std::to_string(errorCode) + ")</p>"
-            "</body></html>";
+        // Don't display an error page if the user initiated the stop
+        if (errorCode == ERR_ABORTED) {
+            return;
+        }
 
-        frame->LoadString(error_html, failedUrl);
+        // Display error page within the frame
+        std::string error_html = "<html><body bgcolor=\"#F0F0F0\">"
+            "<h2>Page Load Error</h2>"
+            "<p>Failed to load URL: " + failedUrl.ToString() + "</p>"
+            "<p>Error: " + errorText.ToString() +
+            " (Code: " + std::to_string(errorCode) + ")</p>"
+            "</body></html>";
+        frame->LoadString(error_html, "data:text/html,chromewebdata");
     }
 }
+
+// --- CefDisplayHandler methods ---
 
 void BrowserHandler::OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) {
     std::lock_guard<std::mutex> lock(m_mutex);

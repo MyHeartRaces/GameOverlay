@@ -1,5 +1,4 @@
 // GameOverlay - BrowserHandler.h
-// Phase 6: DirectX 12 Migration
 // Handles browser events and rendering callbacks for DirectX 12
 
 #pragma once

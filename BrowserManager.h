@@ -1,5 +1,4 @@
 // GameOverlay - BrowserManager.h
-// Phase 2: CEF Integration
 // Manages CEF initialization and browser instances
 
 #pragma once
@@ -14,9 +13,13 @@
 #include "cef_browser.h"
 #include "BrowserHandler.h"
 
+// Forward declaration
+class BrowserView;
+
 class BrowserManager {
 public:
-    BrowserManager();
+    // Pass BrowserView for signalling texture updates
+    BrowserManager(BrowserView* view);
     ~BrowserManager();
 
     // Disable copy and move
@@ -50,10 +53,10 @@ public:
     // CEF process handling
     void DoMessageLoopWork();
 
-    // Rendering
-    void OnPaint(void* shared_texture);
-    unsigned int GetBrowserWidth() const { return m_browserWidth; }
-    unsigned int GetBrowserHeight() const { return m_browserHeight; }
+    // Rendering - Called by BrowserHandler's OnPaint via BrowserClient
+    void OnPaint(const void* buffer, int width, int height);
+    unsigned int GetBrowserWidth() const; // Use handler's width
+    unsigned int GetBrowserHeight() const; // Use handler's height
 
     // Handler access
     BrowserHandler* GetBrowserHandler() { return m_browserHandler.get(); }
@@ -65,12 +68,14 @@ private:
     // CEF objects
     CefRefPtr<CefBrowser> m_browser;
     CefRefPtr<BrowserHandler> m_browserHandler;
+    CefRefPtr<BrowserClient> m_browserClient; // Keep ref to client
 
     // State
     bool m_initialized = false;
-    unsigned int m_browserWidth = 1024;
-    unsigned int m_browserHeight = 768;
 
     // Subprocess handling
     bool m_isSubprocess = false;
+
+    // Pointer back to BrowserView (not owned) to signal updates
+    BrowserView* m_browserView = nullptr;
 };

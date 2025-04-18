@@ -1,15 +1,20 @@
 // GameOverlay - BrowserView.cpp
-// Phase 6: DirectX 12 Migration
 // Manages browser rendering and DirectX 12 integration
 
 #include "BrowserView.h"
-#include "ResourceManager.h"
+#include "ResourceManager.h" // Include ResourceManager
 #include <stdexcept>
 #include <algorithm>
+#include <vector> // For intermediate buffer copy
 
 BrowserView::BrowserView(RenderSystem* renderSystem)
     : m_renderSystem(renderSystem),
-    m_browserManager(std::make_unique<BrowserManager>()) {
+    // Pass 'this' to BrowserManager for signalling
+    m_browserManager(std::make_unique<BrowserManager>(this))
+{
+    if (!m_renderSystem) {
+        throw std::invalid_argument("RenderSystem cannot be null");
+    }
 }
 
 BrowserView::~BrowserView() {
@@ -19,320 +24,333 @@ BrowserView::~BrowserView() {
 bool BrowserView::Initialize() {
     // Initialize browser manager
     if (!m_browserManager->Initialize(GetModuleHandle(NULL))) {
-        return false;
+        // Initialization might fail if it's a CEF subprocess, which is expected.
+        // Or it could be a real error. BrowserManager returns false for subprocess.
+        // We might need a better way to distinguish these cases if necessary.
+        // OutputDebugStringA("BrowserManager Initialize failed.\n");
+        // For now, assume failure means error if not a subprocess (manager handles that check)
+        if (!m_browserManager->m_isSubprocess) { // Accessing member directly - consider a getter
+            OutputDebugStringA("Error: BrowserManager failed to initialize CEF.\n");
+            return false;
+        }
+        // If it's a subprocess, Initialize returns false but it's not an error state for the main app.
+        // The subprocess will exit via CefExecuteProcess. The main app continues.
+        // So we might return true here conceptually, but the main app needs to handle
+        // the case where the manager isn't fully usable.
+        // Let's refine: Initialize should only return false on *actual* error in the main process.
     }
 
-    // Create browser texture
-    CreateBrowserTexture(m_width, m_height);
+    // Create browser texture resources (GPU texture + upload buffer)
+    CreateBrowserTextureResources(m_width, m_height);
 
-    // Create browser
-    if (!m_browserManager->CreateBrowser("about:blank")) {
-        return false;
+    // Create the actual browser instance
+    // Make sure manager is actually initialized (not a subprocess)
+    if (m_browserManager->m_initialized) { // Check initialization state
+        if (!m_browserManager->CreateBrowser("about:blank")) {
+            OutputDebugStringA("Error: Failed to create CEF browser instance.\n");
+            ReleaseBrowserTextureResources(); // Clean up textures if browser fails
+            return false;
+        }
+        // Set initial size for the browser handler via the manager
+        m_browserInternalWidth = static_cast<int>(m_width * m_renderQuality);
+        m_browserInternalHeight = static_cast<int>(m_height * m_renderQuality);
+        if (m_browserManager->GetBrowserHandler()) {
+            m_browserManager->GetBrowserHandler()->SetBrowserSize(m_browserInternalWidth, m_browserInternalHeight);
+        }
+        // Tell the host it was resized after creation
+        if (m_browserManager->GetBrowser() && m_browserManager->GetBrowser()->GetHost()) {
+            m_browserManager->GetBrowser()->GetHost()->WasResized();
+        }
+    }
+    else {
+        // This case implies Initialize returned false due to being a subprocess.
+        // The main application instance doesn't need a browser in this case.
+        // It might need adjustment depending on how subprocess handling is intended.
+        // Let's assume Initialize throws on real error, and returns false only for subprocess.
     }
 
     return true;
 }
 
 void BrowserView::Shutdown() {
-    // Release browser resources
+    // Release browser resources first
     if (m_browserManager) {
         m_browserManager->Shutdown();
     }
+    m_browserManager.reset(); // Release manager itself
 
     // Release texture resources
-    ReleaseBrowserTexture();
+    ReleaseBrowserTextureResources();
+
+    // Nullify render system pointer (it's not owned)
+    m_renderSystem = nullptr;
 }
 
 void BrowserView::Navigate(const std::string& url) {
-    if (m_browserManager) {
+    if (m_browserManager && m_browserManager->m_initialized) {
         m_browserManager->LoadURL(url);
     }
 }
 
 void BrowserView::Resize(int width, int height) {
-    if (width <= 0 || height <= 0) return;
+    if (!m_renderSystem || width <= 0 || height <= 0) return;
 
-    // Apply render quality to dimensions
-    int scaledWidth = static_cast<int>(width * m_renderQuality);
-    int scaledHeight = static_cast<int>(height * m_renderQuality);
+    bool needsResize = (m_width != width || m_height != height);
+    bool internalSizeChanged = false;
 
-    // Ensure minimum dimensions
-    scaledWidth = std::max(scaledWidth, 1);
-    scaledHeight = std::max(scaledHeight, 1);
-
-    // Update dimensions
     m_width = width;
     m_height = height;
 
-    // Update browser handler size with scaled dimensions
-    if (m_browserManager && m_browserManager->GetBrowserHandler()) {
-        m_browserManager->GetBrowserHandler()->SetBrowserSize(scaledWidth, scaledHeight);
+    // Apply render quality to get internal browser dimensions
+    int newInternalWidth = std::max(1, static_cast<int>(width * m_renderQuality));
+    int newInternalHeight = std::max(1, static_cast<int>(height * m_renderQuality));
+
+    if (m_browserInternalWidth != newInternalWidth || m_browserInternalHeight != newInternalHeight) {
+        m_browserInternalWidth = newInternalWidth;
+        m_browserInternalHeight = newInternalHeight;
+        internalSizeChanged = true;
     }
 
-    // Recreate browser texture with actual dimensions
-    ReleaseBrowserTexture();
-    CreateBrowserTexture(width, height);
+    // Update browser handler size if it changed
+    if (internalSizeChanged && m_browserManager && m_browserManager->GetBrowserHandler()) {
+        m_browserManager->GetBrowserHandler()->SetBrowserSize(m_browserInternalWidth, m_browserInternalHeight);
+        // Notify the browser host about the resize
+        if (m_browserManager->GetBrowser() && m_browserManager->GetBrowser()->GetHost()) {
+            m_browserManager->GetBrowser()->GetHost()->WasResized();
+        }
+    }
 
-    // Force an update
-    m_needsUpdate = true;
+    // Recreate texture resources only if logical dimensions changed
+    if (needsResize) {
+        // Wait for GPU before releasing resources tied to the swap chain/command lists
+        m_renderSystem->WaitForGpu();
+        ReleaseBrowserTextureResources();
+        CreateBrowserTextureResources(m_width, m_height);
+    }
+
+    // Force an update check in the message loop
+    m_textureNeedsGPUCopy = true; // Assume resize requires redraw
 }
 
-void BrowserView::Render() {
+void BrowserView::Update() {
     // Skip processing if suspended
     if (m_processingIsSuspended) {
         return;
     }
 
-    // Apply frame limiting based on update frequency
+    // Process message loop only according to frequency
     m_frameCounter++;
     if (m_frameCounter >= m_framesPerUpdate) {
         m_frameCounter = 0;
-        m_needsUpdate = true;
-    }
-
-    // Process CEF message loop and render only when needed
-    if (m_browserManager && m_needsUpdate) {
-        m_browserManager->DoMessageLoopWork();
-
-        // Set shared texture for rendering
-        if (m_browserTexture && m_uploadTexture) {
-            m_browserManager->OnPaint(m_uploadTexture.Get());
+        if (m_browserManager && m_browserManager->m_initialized) {
+            m_browserManager->DoMessageLoopWork();
         }
-
-        m_needsUpdate = false;
     }
+    // Note: OnPaint is triggered by DoMessageLoopWork and calls SignalTextureUpdateFromHandler
 }
 
-void BrowserView::CreateBrowserTexture(int width, int height) {
+// Called by BrowserManager when BrowserHandler::OnPaint fires
+void BrowserView::SignalTextureUpdateFromHandler(const void* buffer, int width, int height) {
+    // This is called from CEF's thread, so use a mutex if accessing shared members that aren't atomic
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
+    m_cpuBufferData = buffer; // Store pointer temporarily
+    m_cpuBufferWidth = width;
+    m_cpuBufferHeight = height;
+    m_textureNeedsGPUCopy = true; // Set the flag indicating GPU copy is required
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE BrowserView::GetTextureGpuHandle() const {
+    if (m_renderSystem && m_renderSystem->GetResourceManager() && m_srvDescriptorIndex != UINT_MAX) {
+        // Ensure the descriptor index is valid before getting the handle
+        return m_renderSystem->GetResourceManager()->GetGpuDescriptorHandle(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, m_srvDescriptorIndex
+        );
+    }
+    return {}; // Return a null handle if invalid
+}
+
+
+void BrowserView::CreateBrowserTextureResources(int width, int height) {
     if (!m_renderSystem || width <= 0 || height <= 0) return;
 
     ID3D12Device* device = m_renderSystem->GetDevice();
-    if (!device) return;
-
-    // Get resource manager
     ResourceManager* resourceManager = m_renderSystem->GetResourceManager();
-    if (!resourceManager) return;
+    if (!device || !resourceManager) return;
 
-    // Create texture in default heap (GPU-only)
+    // Ensure previous resources are released (important if called during resize)
+    ReleaseBrowserTextureResources();
+
+    // 1. Create the target texture in the default heap (GPU optimal)
     m_browserTexture = resourceManager->CreateTexture2D(
         width, height,
-        DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM, // Format CEF typically provides (BGRA)
         D3D12_RESOURCE_FLAG_NONE,
         D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_STATE_COPY_DEST
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE // Initial state for rendering
     );
 
     if (!m_browserTexture) {
-        throw std::runtime_error("Failed to create browser texture");
+        throw std::runtime_error("Failed to create browser target texture (GPU)");
     }
+    m_browserTexture->SetName(L"Browser Target Texture"); // Debug name
 
-    // Create upload texture for CPU write
-    size_t rowPitch = (width * 4 + 255) & ~255; // Align to 256 bytes
+    // 2. Create the upload heap texture for CPU writes
+    // Calculate required size based on pitch alignment
+    // BGRA is 4 bytes per pixel
+    size_t rowPitch = (static_cast<size_t>(width) * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     size_t uploadBufferSize = rowPitch * height;
 
     m_uploadTexture = resourceManager->CreateUploadBuffer(uploadBufferSize);
     if (!m_uploadTexture) {
-        throw std::runtime_error("Failed to create upload texture");
+        throw std::runtime_error("Failed to create browser upload texture (CPU)");
     }
+    m_uploadTexture->SetName(L"Browser Upload Texture"); // Debug name
 
-    // Create shader resource view
+    // 3. Create Shader Resource View (SRV) for the target texture
+    m_srvDescriptorIndex = resourceManager->AllocateDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (m_srvDescriptorIndex == UINT_MAX) {
-        m_srvDescriptorIndex = resourceManager->AllocateDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        throw std::runtime_error("Failed to allocate descriptor for browser texture SRV");
     }
 
-    // Create SRV
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // Match texture format
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Texture2D.MipLevels = 1;
     srvDesc.Texture2D.MostDetailedMip = 0;
     srvDesc.Texture2D.PlaneSlice = 0;
-    srvDesc.Texture2D.ResourceMinLODClamp = 0;
+    srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
 
     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = resourceManager->GetCpuDescriptorHandle(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, m_srvDescriptorIndex);
 
+    if (srvHandle.ptr == 0) {
+        throw std::runtime_error("Failed to get CPU descriptor handle for browser SRV");
+    }
+
     device->CreateShaderResourceView(m_browserTexture.Get(), &srvDesc, srvHandle);
 
-    // Initial transition to shader resource state
-    ID3D12GraphicsCommandList* commandList = m_renderSystem->GetCommandList();
-    if (commandList) {
-        resourceManager->TransitionResource(
-            commandList,
-            m_browserTexture.Get(),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-        );
-    }
+    // No initial transition needed here if CreateTexture2D creates it in PIXEL_SHADER_RESOURCE state
 }
 
-void BrowserView::ReleaseBrowserTexture() {
-    ResourceManager* resourceManager = m_renderSystem->GetResourceManager();
+void BrowserView::ReleaseBrowserTextureResources() {
+    ResourceManager* resourceManager = m_renderSystem ? m_renderSystem->GetResourceManager() : nullptr;
+
+    // Free the descriptor if allocated
     if (resourceManager && m_srvDescriptorIndex != UINT_MAX) {
         resourceManager->FreeDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, m_srvDescriptorIndex);
         m_srvDescriptorIndex = UINT_MAX;
     }
 
+    // Release the texture resources (ComPtr handles this)
     m_browserTexture.Reset();
     m_uploadTexture.Reset();
+
+    // Reset update state
+    m_textureNeedsGPUCopy = false;
+    m_cpuBufferData = nullptr;
+    m_cpuBufferWidth = 0;
+    m_cpuBufferHeight = 0;
 }
 
-void BrowserView::UpdateBrowserTexture(const void* buffer, int width, int height) {
-    if (!buffer || !m_uploadTexture || !m_browserTexture) return;
-
-    ResourceManager* resourceManager = m_renderSystem->GetResourceManager();
-    if (!resourceManager) return;
-
-    // Map the upload buffer
-    D3D12_RANGE readRange = { 0, 0 }; // We're not reading
-    void* mappedData = nullptr;
-    HRESULT hr = m_uploadTexture->Map(0, &readRange, &mappedData);
-    if (FAILED(hr)) return;
-
-    // Copy browser rendering to upload buffer
-    size_t rowPitch = (width * 4 + 255) & ~255; // Align to 256 bytes
-    uint8_t* dest = static_cast<uint8_t*>(mappedData);
-    const uint8_t* src = static_cast<const uint8_t*>(buffer);
-
-    for (int y = 0; y < height; y++) {
-        memcpy(dest + y * rowPitch, src + y * width * 4, width * 4);
-    }
-
-    // Unmap the upload buffer
-    D3D12_RANGE writtenRange = { 0, rowPitch * height };
-    m_uploadTexture->Unmap(0, &writtenRange);
-
-    // Get command list for copy operation
-    ID3D12GraphicsCommandList* commandList = m_renderSystem->GetCommandList();
-    if (!commandList) return;
-
-    // Transition browser texture to copy dest state
-    resourceManager->TransitionResource(
-        commandList,
-        m_browserTexture.Get(),
-        D3D12_RESOURCE_STATE_COPY_DEST
-    );
-
-    // Copy from upload buffer to texture
-    D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
-    srcLocation.pResource = m_uploadTexture.Get();
-    srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLocation.PlacedFootprint.Offset = 0;
-    srcLocation.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srcLocation.PlacedFootprint.Footprint.Width = width;
-    srcLocation.PlacedFootprint.Footprint.Height = height;
-    srcLocation.PlacedFootprint.Footprint.Depth = 1;
-    srcLocation.PlacedFootprint.Footprint.RowPitch = rowPitch;
-
-    D3D12_TEXTURE_COPY_LOCATION dstLocation = {};
-    dstLocation.pResource = m_browserTexture.Get();
-    dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dstLocation.SubresourceIndex = 0;
-
-    commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
-
-    // Transition browser texture back to shader resource state
-    resourceManager->TransitionResource(
-        commandList,
-        m_browserTexture.Get(),
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-    );
-}
+// --- Performance Optimization Methods ---
 
 void BrowserView::AdaptToPerformanceState(PerformanceState state, ResourceUsageLevel level) {
     // Adjust browser parameters based on performance state
+    float targetQuality = 1.0f;
+    int targetUpdateFreq = 1;
+    bool targetSuspend = false;
+
     switch (state) {
     case PerformanceState::Active:
-        // Full quality when active
-        SetRenderQuality(1.0f);
-        SetUpdateFrequency(1);
-        SuspendProcessing(false);
+        targetQuality = 1.0f; targetUpdateFreq = 1; targetSuspend = false;
         break;
-
     case PerformanceState::Inactive:
-        // Reduced quality when inactive
-        SetRenderQuality(0.75f);
-        SetUpdateFrequency(2);
-        SuspendProcessing(false);
+        targetQuality = 0.75f; targetUpdateFreq = 3; targetSuspend = false; // Less frequent updates
         break;
-
     case PerformanceState::Background:
-        // Minimum quality when in background
-        SetRenderQuality(0.5f);
-        SetUpdateFrequency(5);
-        SuspendProcessing(false);
+        targetQuality = 0.5f; targetUpdateFreq = 10; targetSuspend = true; // Suspend if configured
         break;
-
     case PerformanceState::LowPower:
-        // Suspend processing for power saving
-        SetRenderQuality(0.25f);
-        SetUpdateFrequency(10);
-        SuspendProcessing(true);
+        targetQuality = 0.25f; targetUpdateFreq = 15; targetSuspend = true;
         break;
     }
 
     // Further adjust based on resource usage level
     switch (level) {
     case ResourceUsageLevel::Minimum:
-        // Minimum resources
-        SetRenderQuality(0.25f);
-        SetUpdateFrequency(10);
-        if (state != PerformanceState::Active) {
-            SuspendProcessing(true);
-        }
+        targetQuality = std::min(targetQuality, 0.25f);
+        targetUpdateFreq = std::max(targetUpdateFreq, 15);
+        if (state != PerformanceState::Active) targetSuspend = true;
         break;
-
     case ResourceUsageLevel::Low:
-        // Low resources
-        SetRenderQuality(0.5f);
-        SetUpdateFrequency(5);
+        targetQuality = std::min(targetQuality, 0.5f);
+        targetUpdateFreq = std::max(targetUpdateFreq, 10);
+        if (state == PerformanceState::Background || state == PerformanceState::LowPower) targetSuspend = true;
         break;
-
     case ResourceUsageLevel::Balanced:
         // Use state-determined settings
         break;
-
     case ResourceUsageLevel::High:
     case ResourceUsageLevel::Maximum:
-        // Maximum quality if active
+        // Maximum quality if active, less aggressive otherwise
         if (state == PerformanceState::Active) {
-            SetRenderQuality(1.0f);
-            SetUpdateFrequency(1);
+            targetQuality = 1.0f;
+            targetUpdateFreq = 1;
+            targetSuspend = false;
+        }
+        else {
+            // Keep state defaults for inactive/background
         }
         break;
+    }
+
+    // Apply the calculated settings
+    SetRenderQuality(targetQuality);
+    SetUpdateFrequency(targetUpdateFreq);
+    SuspendProcessing(targetSuspend);
+
+    // Optional: Tell CEF about visibility/focus changes for its own optimizations
+    if (m_browserManager && m_browserManager->GetBrowser() && m_browserManager->GetBrowser()->GetHost()) {
+        bool isVisible = (state != PerformanceState::Background && state != PerformanceState::LowPower);
+        bool hasFocus = (state == PerformanceState::Active); // Assuming active means focused
+        m_browserManager->GetBrowser()->GetHost()->WasHidden(!isVisible);
+        m_browserManager->GetBrowser()->GetHost()->SetFocus(hasFocus);
+
+        // Optional: Send occlusion notification
+        // std::vector<CefRect> occlusion_rects;
+        // if (!isVisible) occlusion_rects.push_back(CefRect(0,0,m_width,m_height));
+        // m_browserManager->GetBrowser()->GetHost()->SendExternalBeginFrame();
+        // m_browserManager->GetBrowser()->GetHost()->SendTouchEvent() ...
     }
 }
 
 void BrowserView::SetRenderQuality(float quality) {
-    // Clamp quality to reasonable values
-    quality = std::max(0.25f, std::min(quality, 1.0f));
+    quality = std::max(0.1f, std::min(quality, 1.0f)); // Allow lower minimum quality
 
     if (m_renderQuality != quality) {
         m_renderQuality = quality;
-
-        // Re-apply quality by resizing with current dimensions
+        // Trigger a resize to apply the new internal browser dimensions
         Resize(m_width, m_height);
     }
 }
 
 void BrowserView::SetUpdateFrequency(int framesPerUpdate) {
-    // Clamp to reasonable values
-    framesPerUpdate = std::max(1, std::min(framesPerUpdate, 30));
+    framesPerUpdate = std::max(1, std::min(framesPerUpdate, 60)); // Clamp to reasonable range
 
     if (m_framesPerUpdate != framesPerUpdate) {
         m_framesPerUpdate = framesPerUpdate;
-        m_frameCounter = 0;
-        m_needsUpdate = true;
+        m_frameCounter = 0; // Reset counter
     }
 }
 
 void BrowserView::SuspendProcessing(bool suspend) {
     if (m_processingIsSuspended != suspend) {
         m_processingIsSuspended = suspend;
-
         if (!suspend) {
-            // Force an update when resuming
-            m_needsUpdate = true;
+            // Force an update check when resuming
+            m_textureNeedsGPUCopy = true; // Mark for redraw
         }
+        // Optional: Tell CEF host directly about suspension state if API exists
     }
 }
